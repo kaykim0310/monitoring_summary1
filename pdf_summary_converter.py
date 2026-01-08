@@ -196,19 +196,36 @@ def extract_job_data_impl(pdf_path):
     }
     
     with pdfplumber.open(pdf_path) as pdf:
-        # 1. Company Name from First Line (User Request)
         try:
             first_page_text = pdf.pages[0].extract_text()
             if first_page_text:
                 lines = first_page_text.split('\n')
                 if lines:
-                    # First non-empty line
                     for line in lines:
-                        if line.strip():
-                            # Remove typical garbage like "date", "page" if any, but usually title is good
-                            company_info["name"] = line.strip()
-                            break
-            # Fallback/Refinement with regex (Project Name)
+                        clean_line = line.strip()
+                        if not clean_line: continue
+                        
+                        # Skip typical report headers
+                        if "나-1" in clean_line or "단위작업" in clean_line:
+                            if ":" in clean_line:
+                                # Extract content after colon
+                                temp = clean_line.split(":", 1)[1].strip()
+                                if temp:
+                                    company_info["name"] = temp
+                                    break
+                            continue
+                        
+                        if "측정" in clean_line and "결과" in clean_line: continue
+                        
+                        # If we reached here, it might be the company name line
+                        company_info["name"] = clean_line
+                        break
+                        
+            # Use regex if specific pattern found (more reliable)
+            if "공장명" in first_page_text:
+                m = re.search(r"공장명\s*:\s*(.*?)\s*[○\n]", first_page_text)
+                if m: company_info["name"] = m.group(1).strip()
+
             if "공 사 명" in first_page_text:
                 m = re.search(r"공 사 명\s*:\s*(.*)", first_page_text)
                 if m: company_info["project"] = m.group(1).strip()
@@ -239,8 +256,11 @@ def extract_job_data_impl(pdf_path):
                 
                 current_group = None
                 current_unit = None
-                prev_unit_completed = False
                 
+                # Flag to track if the current unit 'row' seems complete (has workers/form)
+                # If complete, next text implies new unit.
+                unit_row_completed = False
+
                 for row in table:
                     if not row or len(row) < 3: continue
                     
@@ -248,6 +268,7 @@ def extract_job_data_impl(pdf_path):
                     if "공정" in row_full and "작업" in row_full: continue
                     if "측정방법" in row_full or "비고" in row_full: continue 
                     if "평균치" in row_full: continue
+                    if "측정시각" in row_full: continue # Time header
 
                     def get_col(idx):
                         if idx < len(row) and row[idx]:
@@ -260,80 +281,126 @@ def extract_job_data_impl(pdf_path):
                     w_text = get_col(col_map["worker"])
                     form_text = get_col(col_map["form"])
                     
-                    # Worker Val Validation
-                    w_val = None
-                    if w_text and (any(c.isdigit() for c in w_text) or "명" in w_text):
-                        w_val = w_text
+                    # Garbage Filter: Timestamps / Footer
+                    # If any text contains "~" and ":" (e.g. ~ 15:30), it's likely a timestamp row
+                    if re.search(r'~\s*\d{1,2}:\d{2}', row_full) or re.search(r'\d{1,2}:\d{2}\s*~', row_full):
+                        continue
+                    if "종료" in row_full or "시작" in row_full:
+                        continue
                     
-                    # Unit Name Validation: If it looks like a number, it's likely a mis-columned worker count or garbage
+                    # Worker Val: Keep exact string 
+                    w_val = None
+                    if w_text: 
+                         w_val = w_text
+                    
+                    # Unit Name Cleanup: Ignore numeric garbage
                     if u_text and (u_text.isdigit() or re.match(r'^\d+(\s+\d+)*$', u_text) or len(u_text) < 2 and u_text.isdigit()):
-                        # Treat as worker val if worker val is empty
-                        if not w_val:
-                            w_val = u_text
-                        u_text = "" # Ignore as name
+                        if not w_val: w_val = u_text # Fallback
+                        u_text = ""
 
-                    # Determine Group
-                    if g_text:
-                        current_group = g_text
-                        
-                    if not current_group: continue
+                    # Logic: When to start a New Unit?
+                    # 1. Group text exists -> Definitely New Group -> New Unit
+                    # 2. Unit text exists AND Previous Unit was 'Completed' (had workers/factors populated in a way that implies end)
+                    # OR just standard: If Unit text exists -> New Unit (unless it looks like wrapped text).
+                    # 'Wrapped text' heuristic: Previous line had NO workers/form, and this line has text.
                     
                     start_new_unit = False
-                    if g_text: 
+                    
+                    if g_text:
+                        current_group = g_text
                         start_new_unit = True
-                    elif prev_unit_completed and u_text:
-                        start_new_unit = True
-                        
+                    elif u_text:
+                        # If we have text, is it a new unit or continuation?
+                        if unit_row_completed:
+                            start_new_unit = True
+                        else:
+                            # Previous row didn't have workers/form.
+                            # It might be a continuation of the name.
+                            # OR it might be distinct unit that just has no worker data (unlikely for "Distribution" report)
+                            # Let's assume continuation.
+                            start_new_unit = False
+                    
+                    # If we don't have a current unit object yet, force start
+                    if not current_unit and (g_text or u_text):
+                        if not g_text and current_group: # Continuation of group but start of first unit finding
+                             start_new_unit = True
+                        elif g_text:
+                             start_new_unit = True
+
                     if start_new_unit:
                         current_unit = {
                             "name_parts": [],
                             "factors": defaultdict(set),
-                            "workers": 0,
+                            "workers": "", # String accumulation
                             "work_form": set()
                         }
-                        jobs[current_group].append(current_unit)
-                        prev_unit_completed = False
+                        if current_group:
+                            jobs[current_group].append(current_unit)
+                        unit_row_completed = False
                         
                     if not current_unit: continue
                     
-                    if u_text: current_unit["name_parts"].append(u_text)
+                    # 1. Name Parts
+                    if u_text:
+                        current_unit["name_parts"].append(u_text)
                     
+                    # 2. Workers
                     if w_val:
-                        nums = re.findall(r'\d+', w_val)
-                        if nums:
-                            current_unit["workers"] = max(current_unit["workers"], int(nums[0]))
-                        prev_unit_completed = True
+                        # User wants exact string.
+                        # If multiple rows have workers for same 'unit' (merged cells with split rows?), logic says we started new unit?
+                        # If we are here, it means we are in 'current_unit'.
+                        # If 'current_unit' already has workers, and we see NEW workers on this line...
+                        # It suggests we missed a split? 
+                        # Or it's just aggregating.
+                        # Given "Strict Separation", if we see `w_val`, it flags completion.
+                        current_unit["workers"] = w_val # Overwrite or append? "16(4)" usually one line.
+                        unit_row_completed = True
                         
-                    if form_text and "교대" in form_text:
-                        current_unit["work_form"].add(form_text.split()[0])
+                    # 3. Form
+                    if form_text:
+                        if "교대" in form_text:
+                            current_unit["work_form"].add(form_text.split()[0])
+                        unit_row_completed = True # Form implies completion row usually
                             
+                    # 4. Factors
                     if f_text and "유해인자" not in f_text:
-                        if f_text.isdigit(): continue # Skip numbers in factor col
-                        parts = f_text.split()
-                        for p in parts:
-                            p = p.strip()
-                            cat = classify_factor(p)
-                            if cat:
-                                current_unit["factors"][cat].add(p)
+                        if f_text.isdigit(): pass
+                        else:
+                            parts = f_text.split()
+                            for p in parts:
+                                p = p.strip()
+                                cat = classify_factor(p)
+                                if cat:
+                                    current_unit["factors"][cat].add(p)
 
-    # Post-process
-    final_jobs = defaultdict(lambda: defaultdict(dict))
+    # Post-process: Just flatten name parts
+    final_jobs = defaultdict(list)
     
     for grp, unit_list in jobs.items():
+        if not grp: continue
+        # Filter out Header Groups
+        if grp == "공정" or grp == "부서" or grp == "단위작업장소": continue
+        
         for u in unit_list:
             full_name = " ".join(u["name_parts"]).strip()
-            # Clean up: If Name contains only special chars or just numbers (double check)
-            if not full_name or len(full_name) < 2: continue # likely garbage unit
             
-            if full_name in final_jobs[grp]:
-                tgt = final_jobs[grp][full_name]
-                for k, v in u["factors"].items(): tgt["factors"][k].update(v)
-                tgt["workers"] = max(tgt["workers"], u["workers"])
-                tgt["work_form"].update(u["work_form"])
-                tgt["job_content"].add(full_name)
-            else:
-                u["job_content"] = {full_name}
-                final_jobs[grp][full_name] = u
+            # Check for timestamp in worker field (e.g. 07:07) -> Garbage unit
+            w_str = str(u["workers"])
+            if re.search(r'\d{2}:\d{2}', w_str):
+                continue
+            
+            if not full_name: 
+                # If no name, and no significant data, skip
+                if not u["factors"] and not w_str: continue
+                full_name = "(공정명 없음)"
+            
+            # If name is still empty/placeholder and no meaningful data, skip
+            if full_name == "(공정명 없음)" and (not w_str or w_str.strip() == ""):
+                 continue
+
+            # Save refined object
+            u["job_content"] = full_name 
+            final_jobs[grp].append(u)
 
     return company_info, final_jobs
 
@@ -357,27 +424,28 @@ def convert_pdf_to_txt(pdf_path):
     lines.append(f"   작업환경측정 대상 유해인자는 다음과 같습니다.")
     lines.append("-" * 93)
     
-    lines.append("□ 공사개요")
-    lines.append(f"   ◆ 공 사 명: {project_name}")
-    # Dates should be extracted if possible, otherwise blank or placeholder
-    lines.append(f"   ◆ 착공일자: 20  .   .   .") 
-    lines.append(f"   ◆ 준공일자: 20  .   .   .(예정)")
-    lines.append(f"   ◇ 특이사항: 공사현장의 경우 공기에 따라 작업내용이 달라질 수 있으므로 작업환경측정 당일") 
-    lines.append(f"                진행되는 작업을 대상으로 작업환경측정을 실시함.")
     lines.append("-" * 93)
     
-    # 계층적 출력
-    # jobs: group -> unit -> data
+    # lines.append("□ 공사개요")
+    # lines.append(f"   ◆ 공 사 명: {project_name}")
+    # lines.append(f"   ◆ 착공일자: 20  .   .   .") 
+    # lines.append(f"   ◆ 준공일자: 20  .   .   .(예정)")
+    # lines.append(f"   ◇ 특이사항: 공사현장의 경우 공기에 따라 작업내용이 달라질 수 있으므로 작업환경측정 당일") 
+    # lines.append(f"                진행되는 작업을 대상으로 작업환경측정을 실시함.")
+    # lines.append("-" * 93)
     
-    for group_name, units in jobs.items():
+    # 계층적 출력
+    # jobs: group -> list of unit objects
+    
+    for group_name, unit_list in jobs.items():
         if not group_name: continue
         
         # Group Header
         lines.append(f"<< {group_name} >>")
         lines.append("-" * 93)
         
-        for unit_name, data in units.items():
-            if not unit_name: continue
+        for data in unit_list:
+            unit_name = data.get("job_content", "공정")
             
             # Unit Header
             lines.append(f"■ {unit_name}")
@@ -385,8 +453,7 @@ def convert_pdf_to_txt(pdf_path):
             
             # 작업내용
             # unit_name 자체가 작업내용인 경우가 많음
-            contents = ", ".join(sorted(list(data["job_content"])))
-            lines.append(f"   ◇ 작업내용 : {contents}")
+            lines.append(f"   ◇ 작업내용 : {unit_name}")
             lines.append("")
             
             # 유해인자
@@ -398,7 +465,6 @@ def convert_pdf_to_txt(pdf_path):
             if has_factors:
                 lines.append("   ◇ 유해인자 :")
                 current_line_idx = len(lines) - 1
-                lines[current_line_idx] = "   ◇ 유해인자 :"
                 
                 is_first = True
                 for cat in category_order:
@@ -422,9 +488,11 @@ def convert_pdf_to_txt(pdf_path):
                 
             # 근무현황
             forms = ", ".join(sorted(list(data["work_form"])))
-            workers = data["workers"]
-            if workers > 0 or forms:
-                lines.append(f"   ◇ 근무현황 : {workers}명, {forms}")
+            workers = data["workers"] # Now string
+            if workers or forms:
+                term = f"{workers}명" if str(workers).isdigit() else f"{workers}"
+                if forms: term += f", {forms}"
+                lines.append(f"   ◇ 근무현황 : {term}")
             
             lines.append("-" * 93)
 
