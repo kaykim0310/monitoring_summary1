@@ -32,183 +32,401 @@ def classify_factor(factor_name):
         return "기타"
 
 def extract_job_data(pdf_path):
-    # 공정별 데이터 저장
-    # 키: 공정명
-    jobs = defaultdict(lambda: {
-        "job_content": set(),
+    # 계층적 데이터 저장: jobs[group_name][unit_name] = data
+    jobs = defaultdict(lambda: defaultdict(lambda: {
+        "job_content": "", # text accumulating
         "factors": defaultdict(set),
-        "workers": 0, # 단순 합계가 아니라 중복 제거 로직 등이 필요할 수 있음
-        "work_form": set(),
-        "seen_workers": set() # 중복 집계 방지용 (이름 기준)
-    })
+        "workers": 0,
+        "work_form": set()
+    }))
     
     company_info = {}
 
     with pdfplumber.open(pdf_path) as pdf:
-        # 1. 개요 정보 추출 (주로 첫 페이지)
-        first_page_text = pdf.pages[0].extract_text()
-        if "공장명" in first_page_text:
-            match = re.search(r"공장명\s*:\s*(.*?)\s*[○\n]", first_page_text)
-            if match:
-                company_info["name"] = match.group(1).strip()
-            # 공사명 등은 헤더나 상단 텍스트에서 유추
+        # 1. 개요 정보
+        try:
+            first_page_text = pdf.pages[0].extract_text()
+            if "공장명" in first_page_text:
+                match = re.search(r"공장명\s*:\s*(.*?)\s*[○\n]", first_page_text)
+                if match: company_info["name"] = match.group(1).strip()
+            if "공 사 명" in first_page_text:
+                match = re.search(r"공 사 명\s*:\s*(.*)", first_page_text)
+                if match: company_info["project"] = match.group(1).strip()
+        except: pass
         
-        # 2. 테이블 데이터 추출
+        # 2. 테이블 데이터 추출 (text layout strategy)
         for page in pdf.pages:
-            tables = page.extract_tables()
+            # horizontal_strategy="text" 사용
+            tables = page.extract_tables(table_settings={"horizontal_strategy": "text"})
+            
             for table in tables:
                 if not table: continue
                 
-                # 테이블 구조 파악 (헤더 제외)
-                # 보통: 공정명 | ... | 작업장소 | 유해인자 | 근로자수 | ...
-                # 인덱스: 0      2          3          4
+                # State variables
+                current_group = None
+                current_unit_key = None # 임시 식별자(카운터 등) 또는 unit_name
                 
-                # 병합된 셀 처리를 위해 이전 행 값 기억
-                last_job = None
+                # 현재 Unit의 상태
+                unit_completed = False
+                unit_text_buffer = []
                 
-                for row_idx, row in enumerate(table):
-                    # 헤더 건너뛰기
+                # 이전 루프의 Group 유지를 위해
+                if not 'last_persistent_group' in locals():
+                    last_persistent_group = None
+
+                for row in table:
+                    # 너무 짧거나 헤더인 경우 스킵
                     if not row or len(row) < 5: continue
-                    if "공정명" in str(row[0]) or "부서" in str(row[0]): continue
+                    # 헤더 판별 (텍스트 포함 여부)
+                    row_str = "".join([str(x) for x in row if x])
+                    if "공정명" in row_str or "부서" in row_str: continue
 
-                    # 공정명 (Col 0)
-                    job_name = row[0]
-                    if job_name:
-                        job_name = job_name.replace("\n", "").strip()
-                        last_job = job_name
-                    else:
-                        job_name = last_job # 병합된 셀 처리
+                    # 컬럼 추출 (인덱스 조심, text strategy는 컬럼이 밀릴 수 있음)
+                    # 보통 0:Group, 1:Null?, 2..:Unit?, ..:Workers?
+                    # 공백 컬럼이 많을 수 있으니 index heuristic 필요 할 수도 있지만
+                    # pdfplumber는 col 구조를 유지하려고 노력함.
+                    # Col 0: Group (might be empty)
+                    # Col 2: Job Content (might be empty)
+                    # Col 3: Factors
+                    # Col 4: Worker Count (Numeric?)
+                    # Col 5: Work Form
                     
-                    if not job_name: continue
-
-                    # 작업장소/내용 (Col 2)
-                    if len(row) > 2 and row[2]:
-                        content = row[2].replace("\n", " ").strip()
-                        if content and "작업장소" not in content:
-                            jobs[job_name]["job_content"].add(content)
-                            
-                    # 유해인자 (Col 3)
-                    if len(row) > 3 and row[3]:
-                        factor_raw = row[3]
-                        if factor_raw and "유해인자" not in factor_raw:
-                            factors = factor_raw.replace("\n", " ").split() # 공백이나 줄바꿈으로 분리
-                            # 또는 한글/영문 혼합 시 정규식 분리 고려
-                            # 여기서는 단순 분리 후 정제
-                            for f in factors:
-                                f = f.strip()
-                                if not f: continue
-                                category = classify_factor(f)
-                                if category:
-                                    jobs[job_name]["factors"][category].add(f)
-
-                    # 근로자 - 중복 방지 (이름이 Col 7에 있다고 가정하거나, 단순히 row 단위로 집계)
-                    # PDF 덤프를 보면 Col 4에 '자수', Col 7에 '근로자명'이 있음
-                    # Col 4: '13', '6' 등 (부서 전체 인원일 수 있음)
-                    # 측정치 행마다가 아니라 공정별로 한번만 가져와야 함.
-                    # 여기서는 '근로자명'(Col 7)이 있으면 카운트 하거나,
-                    # Col 4(자수)가 숫자로 있으면 max 값을 취하는 전략 등 (페이지 넘김 고려)
-                    
+                    # Col 4 (Worker) Check
+                    worker_val = None
                     if len(row) > 4 and row[4]:
-                         val = row[4].replace("\n", "").strip()
-                         if val.isdigit():
-                             # 해당 공정의 근로자수로 업데이트 (보통 같은 공정 행에는 같은 숫자가 적혀있음)
-                             current_max = jobs[job_name]["workers"]
-                             jobs[job_name]["workers"] = max(current_max, int(val))
+                         val = str(row[4]).replace("\n", "").strip()
+                         # 숫자 포함 여부
+                         if any(c.isdigit() for c in val):
+                             worker_val = val
 
-                    # 근무형태 (Col 5)
-                    if len(row) > 5 and row[5]:
-                        form = row[5].replace("\n", " ").strip()
-                        if "교대" in form:
-                            jobs[job_name]["work_form"].add(form.split()[0])
+                    # Col 0 (Group) Check
+                    group_text = row[0]
+                    if group_text:
+                        group_text = str(group_text).replace("\n", "").strip()
 
-    return company_info, jobs
+                    # Col 2 (Unit Text)
+                    unit_text_part = ""
+                    if len(row) > 2 and row[2]:
+                        unit_text_part = str(row[2]).replace("\n", " ").strip()
+
+                    # Logic to Switch Unit/Group
+                    if group_text:
+                        # Case 1: Start New Group -> Force New Unit
+                        last_persistent_group = group_text
+                        current_group = group_text
+                        
+                        # Start New Unit
+                        if unit_text_buffer: # Commit previous if buffer exists (though logic should have handled it)
+                            pass 
+                        
+                        unit_text_buffer = [unit_text_part] if unit_text_part else []
+                        unit_completed = False
+                        
+                        # 만약 이 라인에 worker도 있다면? -> Completed immediately
+                        if worker_val:
+                            unit_completed = True
+                            
+                    else:
+                        # Case 2: Same Group (Col 0 empty)
+                        current_group = last_persistent_group
+                        
+                        if not current_group: continue # Skip junk rows before first group
+                        
+                        if unit_completed and unit_text_part:
+                            # Previous unit finished, and we see new text -> Start New Unit
+                            unit_text_buffer = [unit_text_part]
+                            unit_completed = False
+                        else:
+                            # Continuation
+                            if unit_text_part:
+                                unit_text_buffer.append(unit_text_part)
+                        
+                        if worker_val:
+                             unit_completed = True
+
+                    # Factor Accumulation & Store
+                    # Since we don't know "When unit ends" until we start new one, 
+                    # we should update the "Current Unit object" continuously.
+                    # But the "Key" for the unit is the Text itself?
+                    # Issue: Text accumulates over lines.
+                    # Solution: Use a "Unit Object" reference.
+                    
+                    # Instead of dict jobs[group][name], let's use a list of units or keeping a pointer.
+                    # jobs[group] = [ {unit_data}, ... ]
+                    
+                    # But return format expects dict items.
+                    # Let's use `jobs[group][index]` or maintain a "Current Unit Object".
+                    
+                    # Simpler: Update the `last unit object` in the list.
+                    # Whenever "Start New Unit" happens, create new object.
+                    
+                    # "Start New Unit" condition re-evaluated:
+                    is_new_unit = False
+                    if group_text: 
+                        is_new_unit = True
+                    elif unit_completed and unit_text_part: # Was completed, seeing new text implies new unit
+                        # Wait, `unit_completed` was set in PREVIOUS row?
+                        # Yes, I used `unit_completed` state variable.
+                        # BUT, I need to check `unit_completed` (from prev row) BEFORE setting it for this row.
+                        # My logic above: 
+                        # `if unit_completed and unit_text_part:` -> Start New Unit.
+                        is_new_unit = True
+                    
+                    # Re-structuring the loop logic properly:
+                    
+                table_iterator = iter(table)
+                # ... rewriting inside `extract_job_data` ...
+                pass 
+                
+    # Re-writing the function logic cleanly
+    # (Since I cannot edit inside tool call as text, I will write the full function string below)
+    return extract_job_data_impl(pdf_path)
+
+def extract_job_data_impl(pdf_path):
+    jobs = defaultdict(list) 
+    company_info = {}
+    
+    # Default indices (heuristic)
+    col_map = {
+        "group": 0,
+        "unit": 3,
+        "factor": 4, 
+        "worker": 5, 
+        "form": 6
+    }
+    
+    with pdfplumber.open(pdf_path) as pdf:
+        # 1. Company Name from First Line (User Request)
+        try:
+            first_page_text = pdf.pages[0].extract_text()
+            if first_page_text:
+                lines = first_page_text.split('\n')
+                if lines:
+                    # First non-empty line
+                    for line in lines:
+                        if line.strip():
+                            # Remove typical garbage like "date", "page" if any, but usually title is good
+                            company_info["name"] = line.strip()
+                            break
+            # Fallback/Refinement with regex (Project Name)
+            if "공 사 명" in first_page_text:
+                m = re.search(r"공 사 명\s*:\s*(.*)", first_page_text)
+                if m: company_info["project"] = m.group(1).strip()
+        except: pass
+
+        for page in pdf.pages:
+            tables = page.extract_tables(table_settings={"horizontal_strategy": "text"})
+            for table in tables:
+                if not table: continue
+                
+                # 1. Detect Header
+                header_found = False
+                for row in table[:5]:
+                    if not row: continue
+                    row_str = "".join([str(x) for x in row if x])
+                    if "공정" in row_str and ("작업" in row_str or "장소" in row_str):
+                        for cb_idx, cell in enumerate(row):
+                            if not cell: continue
+                            txt = str(cell).replace(" ", "")
+                            if "공정" in txt or "부서" in txt: col_map["group"] = cb_idx
+                            elif "작업" in txt or "장소" in txt or "단위" in txt: col_map["unit"] = cb_idx
+                            elif "유해" in txt or "인자" in txt: col_map["factor"] = cb_idx
+                            elif "근로" in txt or "자수" in txt or "측정치" in txt:
+                                if "치" not in txt: col_map["worker"] = cb_idx
+                            elif "형태" in txt or "근무" in txt: col_map["form"] = cb_idx
+                        header_found = True
+                        break
+                
+                current_group = None
+                current_unit = None
+                prev_unit_completed = False
+                
+                for row in table:
+                    if not row or len(row) < 3: continue
+                    
+                    row_full = "".join([str(x) for x in row if x])
+                    if "공정" in row_full and "작업" in row_full: continue
+                    if "측정방법" in row_full or "비고" in row_full: continue 
+                    if "평균치" in row_full: continue
+
+                    def get_col(idx):
+                        if idx < len(row) and row[idx]:
+                            return str(row[idx]).replace("\n", " ").strip()
+                        return ""
+                    
+                    g_text = get_col(col_map["group"])
+                    u_text = get_col(col_map["unit"])
+                    f_text = get_col(col_map["factor"])
+                    w_text = get_col(col_map["worker"])
+                    form_text = get_col(col_map["form"])
+                    
+                    # Worker Val Validation
+                    w_val = None
+                    if w_text and (any(c.isdigit() for c in w_text) or "명" in w_text):
+                        w_val = w_text
+                    
+                    # Unit Name Validation: If it looks like a number, it's likely a mis-columned worker count or garbage
+                    if u_text and (u_text.isdigit() or re.match(r'^\d+(\s+\d+)*$', u_text) or len(u_text) < 2 and u_text.isdigit()):
+                        # Treat as worker val if worker val is empty
+                        if not w_val:
+                            w_val = u_text
+                        u_text = "" # Ignore as name
+
+                    # Determine Group
+                    if g_text:
+                        current_group = g_text
+                        
+                    if not current_group: continue
+                    
+                    start_new_unit = False
+                    if g_text: 
+                        start_new_unit = True
+                    elif prev_unit_completed and u_text:
+                        start_new_unit = True
+                        
+                    if start_new_unit:
+                        current_unit = {
+                            "name_parts": [],
+                            "factors": defaultdict(set),
+                            "workers": 0,
+                            "work_form": set()
+                        }
+                        jobs[current_group].append(current_unit)
+                        prev_unit_completed = False
+                        
+                    if not current_unit: continue
+                    
+                    if u_text: current_unit["name_parts"].append(u_text)
+                    
+                    if w_val:
+                        nums = re.findall(r'\d+', w_val)
+                        if nums:
+                            current_unit["workers"] = max(current_unit["workers"], int(nums[0]))
+                        prev_unit_completed = True
+                        
+                    if form_text and "교대" in form_text:
+                        current_unit["work_form"].add(form_text.split()[0])
+                            
+                    if f_text and "유해인자" not in f_text:
+                        if f_text.isdigit(): continue # Skip numbers in factor col
+                        parts = f_text.split()
+                        for p in parts:
+                            p = p.strip()
+                            cat = classify_factor(p)
+                            if cat:
+                                current_unit["factors"][cat].add(p)
+
+    # Post-process
+    final_jobs = defaultdict(lambda: defaultdict(dict))
+    
+    for grp, unit_list in jobs.items():
+        for u in unit_list:
+            full_name = " ".join(u["name_parts"]).strip()
+            # Clean up: If Name contains only special chars or just numbers (double check)
+            if not full_name or len(full_name) < 2: continue # likely garbage unit
+            
+            if full_name in final_jobs[grp]:
+                tgt = final_jobs[grp][full_name]
+                for k, v in u["factors"].items(): tgt["factors"][k].update(v)
+                tgt["workers"] = max(tgt["workers"], u["workers"])
+                tgt["work_form"].update(u["work_form"])
+                tgt["job_content"].add(full_name)
+            else:
+                u["job_content"] = {full_name}
+                final_jobs[grp][full_name] = u
+
+    return company_info, final_jobs
+
+def extract_job_data(pdf_path):
+    return extract_job_data_impl(pdf_path)
 
 def convert_pdf_to_txt(pdf_path):
     company_info, jobs = extract_job_data(pdf_path)
     
     lines = []
-    lines.append("-" * 93) # 구분선 길이 조정
+    lines.append("-" * 93)
     
-    company = company_info.get("name", "(주)동양건설산업")
-    if "(주)" not in company and "동양" in company: company = "(주)" + company
+    company = company_info.get("name", "OOO회사") # Default to generic
+    if company and "(주)" not in company and "동양" not in company and "건설" in company: 
+         # Simple heuristic, but safer to just use what is found or generic
+         pass
     
-    # 제목 부분
-    lines.append(f"■ {company} 고속국도 제14호선 함양~창녕간 건설공사 제12공구에 대한 공정별 작업내용과")
+    project_name = company_info.get("project", "OOOO 공사") # Generic default
+    
+    lines.append(f"■ {company} {project_name}에 대한 공정별 작업내용과")
     lines.append(f"   작업환경측정 대상 유해인자는 다음과 같습니다.")
     lines.append("-" * 93)
     
     lines.append("□ 공사개요")
-    lines.append(f"   ◆ 공 사 명: 고속국도 제14호선 함양~창녕간 건설공사 제12공구")
-    lines.append(f"   ◆ 착공일자: 2019. 02. 20")
-    lines.append(f"   ◆ 준공일자: 2026. 12. 31(예정)")
+    lines.append(f"   ◆ 공 사 명: {project_name}")
+    # Dates should be extracted if possible, otherwise blank or placeholder
+    lines.append(f"   ◆ 착공일자: 20  .   .   .") 
+    lines.append(f"   ◆ 준공일자: 20  .   .   .(예정)")
     lines.append(f"   ◇ 특이사항: 공사현장의 경우 공기에 따라 작업내용이 달라질 수 있으므로 작업환경측정 당일") 
     lines.append(f"                진행되는 작업을 대상으로 작업환경측정을 실시함.")
     lines.append("-" * 93)
     
-    # 공정 순서 (PDF 등장 순서대로 하거나 정렬)
-    # 딕셔너리는 순서 보장 (Python 3.7+)
+    # 계층적 출력
+    # jobs: group -> unit -> data
     
-    for job_name, data in jobs.items():
-        if not job_name: continue
+    for group_name, units in jobs.items():
+        if not group_name: continue
         
-        lines.append(f"■ {job_name}")
+        # Group Header
+        lines.append(f"<< {group_name} >>")
         lines.append("-" * 93)
         
-        # 작업내용
-        contents = ", ".join(sorted(list(data["job_content"])))
-        lines.append(f"   ◇ 작업내용 : {contents}")
-        lines.append("")
-        
-        # 유해인자
-        # lines.append("   ◇ 유해인자 : ", end="") # Error fix
-        lines.append("   ◇ 유해인자 :")
-        # 수정: 라인 추가 방식 변경
-        current_line_idx = len(lines) - 1
-        lines[current_line_idx] = "   ◇ 유해인자 :" # 덮어쓰기
-        
-        category_order = ["물리적인자", "분진류", "금속류", "유기화합물", "산 및 알칼리류", "기타"]
-        
-        is_first = True
-        for cat in category_order:
-            if cat in data["factors"] and data["factors"][cat]:
-                factors = sorted(list(data["factors"][cat]))
-                factors_str = ", ".join(factors)
+        for unit_name, data in units.items():
+            if not unit_name: continue
+            
+            # Unit Header
+            lines.append(f"■ {unit_name}")
+            lines.append("-" * 93)
+            
+            # 작업내용
+            # unit_name 자체가 작업내용인 경우가 많음
+            contents = ", ".join(sorted(list(data["job_content"])))
+            lines.append(f"   ◇ 작업내용 : {contents}")
+            lines.append("")
+            
+            # 유해인자
+            category_order = ["물리적인자", "분진류", "금속류", "유기화합물", "산 및 알칼리류", "기타"]
+            
+            # 유해인자 유무 확인 for Printing "◇ 유해인자 :"
+            has_factors = any(data["factors"][cat] for cat in category_order)
+            
+            if has_factors:
+                lines.append("   ◇ 유해인자 :")
+                current_line_idx = len(lines) - 1
+                lines[current_line_idx] = "   ◇ 유해인자 :"
                 
-                header = f"* {cat}"
-                # 정렬 맞추기: "* 물리적인자 :" (길이 고려)
-                # 템플릿: "* 물리적인자 : 소음" (띄어쓰기 1칸)
-                # 템플릿: "                 * 분진류     : ..." (줄바꿈 후 들여쓰기)
+                is_first = True
+                for cat in category_order:
+                    if cat in data["factors"] and data["factors"][cat]:
+                        factors = sorted(list(data["factors"][cat]))
+                        factors_str = ", ".join(factors)
+                        
+                        # 포맷팅
+                        if cat == "물리적인자": cat_disp = "물리적인자 :"
+                        elif cat == "분진류":     cat_disp = "분진류     :"
+                        elif cat == "금속류":     cat_disp = "금속류     :"
+                        elif cat == "유기화합물": cat_disp = "유기화합물 :"
+                        else:                     cat_disp = f"{cat:<10} :"
+                        
+                        if is_first:
+                            lines[current_line_idx] = f"   ◇ 유해인자 : * {cat_disp} {factors_str}"
+                            is_first = False
+                        else:
+                            lines.append(f"                 * {cat_disp} {factors_str}")
+                lines.append("") # 공백
                 
-                # 카테고리명 뒤 공백 패딩 로직 (템플릿 처럼 '분진류     :')
-                # 물리적인자(5글자) 기준?
-                pad_len = 5 - len(cat) # 단순 길이 차이
-                if pad_len < 0: pad_len = 0
-                # spacer = " " * (pad_len * 2) # 한글 2byte 고려 대충
-                # 템플릿 레이아웃 하드코딩에 가깝게
-                
-                if cat == "물리적인자": cat_disp = "물리적인자 :"
-                elif cat == "분진류":     cat_disp = "분진류     :"
-                elif cat == "금속류":     cat_disp = "금속류     :"
-                elif cat == "유기화합물": cat_disp = "유기화합물 :"
-                else:                     cat_disp = f"{cat} :"
-                
-                if is_first:
-                    lines[current_line_idx] += f" {header} : {factors_str}" # 첫 줄은 옆에 붙임? 아님 템플릿은?
-                    # 템플릿: "   ◇ 유해인자 : * 물리적인자 : 소음" -> 한 줄임
-                    # 내 코드 수정:
-                    lines[current_line_idx] = f"   ◇ 유해인자 : * {cat_disp} {factors_str}"
-                    is_first = False
-                else:
-                    lines.append(f"                 * {cat_disp} {factors_str}")
-        
-        lines.append("") # 공백 라인
-        
-        # 근무현황
-        forms = ", ".join(sorted(list(data["work_form"])))
-        workers = data["workers"]
-        lines.append(f"   ◇ 근무현황 : {workers}명, {forms}")
-        
-        lines.append("-" * 93)
+            # 근무현황
+            forms = ", ".join(sorted(list(data["work_form"])))
+            workers = data["workers"]
+            if workers > 0 or forms:
+                lines.append(f"   ◇ 근무현황 : {workers}명, {forms}")
+            
+            lines.append("-" * 93)
 
     return "\n".join(lines)
 
